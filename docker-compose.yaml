@@ -1,0 +1,53 @@
+networks:
+  redis_network:
+    driver: bridge
+
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    networks:
+      - redis_network
+    platform: linux/amd64
+
+  collector:
+    build:
+      context: .
+      dockerfile: ./collector/Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - TOPIC_NAME=env_data
+    depends_on:
+      - redis
+    volumes:
+      - ./collector:/app
+    networks:
+      - redis_network
+    scale: 1
+    command: >
+      bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 10; done; python collector.py"
+
+  trainer:
+    build:
+      context: .
+      dockerfile: ./trainer/Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - TOPIC_NAME=env_data
+    depends_on:
+      - redis
+    volumes:
+      - ./trainer:/app
+    networks:
+      - redis_network
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    command: >
+      bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 15; done; python train.py"
