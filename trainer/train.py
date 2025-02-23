@@ -116,24 +116,22 @@ def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_
                     writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
 
                 # Save the model periodically
-                if global_step % save_interval == 0:
-                    model_path = f"runs/pong_model_{global_step}.pth"
-                    torch.save(q_network.state_dict(), model_path)
-                    print(f"Model saved at step {global_step} to {model_path}")
+                    if global_step % save_interval == 0:
+                        model_path = f"runs/pong_model_{global_step}.pth"
+                        torch.save(q_network.state_dict(), model_path)
+                        print(f"Model saved at step {global_step} to {model_path}")
 
                 # Update target network periodically (soft update)
-                if global_step % target_network_frequency == 0:
-                    print("Update target network. Global step:", global_step)
-                    for target_param, q_param in zip(target_network.parameters(), q_network.parameters()):
-                        target_param.data.copy_(
-                            tau * q_param.data + (1.0 - tau) * target_param.data
-                        )
+                    if global_step % target_network_frequency == 0:
+                        print("Update target network. Global step:", global_step)
+                        for target_param, q_param in zip(target_network.parameters(), q_network.parameters()):
+                            target_param.data.copy_(tau * q_param.data + (1.0 - tau) * target_param.data)
 
                 # Periodically push the model to Redis (publisher)
-                if global_step % model_push_frequency == 0:
-                    model_data = q_network.state_dict()
-                    redis_client.publish('model_update', pickle.dumps(model_data))
-                    print(f"Model pushed to Redis at step {global_step}")
+                    if global_step % model_push_frequency == 0:
+                        model_data = q_network.state_dict()
+                        redis_client.publish('model_update', pickle.dumps(model_data))
+                        print(f"Model pushed to Redis at step {global_step}")
 
     writer.close()
 
@@ -143,5 +141,5 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = gym.vector.SyncVectorEnv([make_env("Pong-v4", 1, 0, False, "Pong")])
 
 # Start training loop
-training_loop(env=env, total_timesteps=2000000, learning_starts=20000, train_frequency=4, batch_size=32,
-              gamma=0.99, device=device, save_interval=100000, target_network_frequency=1000, tau=0.005, model_push_frequency=10000)
+training_loop(env=env, total_timesteps=2000000, learning_starts=80000, train_frequency=4, batch_size=32,
+              gamma=0.99, device=device, save_interval=100000, target_network_frequency=1000, tau=0.005, model_push_frequency=1000)

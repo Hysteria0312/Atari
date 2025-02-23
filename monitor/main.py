@@ -9,7 +9,6 @@ pynvml.nvmlInit()
 # 获取GPU数量
 device_count = pynvml.nvmlDeviceGetCount()
 
-# 设置监控时间段（例如，监控60秒）
 monitor_duration = 300  # 单位：秒
 sampling_interval = 1  # 每隔1秒采样一次
 
