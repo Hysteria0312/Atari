@@ -14,9 +14,10 @@ from stable_baselines3.common.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv,
 )
+import datetime
 
 # Redis client for subscribing to the data
-redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
+redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
 
 class QNetwork(nn.Module):
     def __init__(self, env):
@@ -65,7 +66,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # Training loop with experience pulled from Redis
 def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_size, gamma, device,
-                  save_interval, target_network_frequency, tau, model_push_frequency):
+                  save_interval, target_network_frequency, tau, model_push_frequency, timestamp_file_path):
     q_network = QNetwork(env).to(device)
     target_network = QNetwork(env).to(device)  # 目标网络
     target_network.load_state_dict(q_network.state_dict())  # 初始化目标网络
@@ -81,6 +82,10 @@ def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_
     global_step = 0
     pubsub = redis_client.pubsub()
     pubsub.subscribe('env_data')
+
+    # Open the timestamp file for writing at the start
+    with open(timestamp_file_path, 'w') as timestamp_file:
+        timestamp_file.write(f"Training started at: {datetime.datetime.now()}\n")
 
     while global_step < total_timesteps:
         for message in pubsub.listen():
@@ -121,7 +126,12 @@ def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_
                         torch.save(q_network.state_dict(), model_path)
                         print(f"Model saved at step {global_step} to {model_path}")
 
-                # Update target network periodically (soft update)
+                        # Log timestamp after model save
+                        with open(timestamp_file_path, 'a') as timestamp_file:
+                            current_time = datetime.datetime.now()
+                            timestamp_file.write(f"Step {global_step}: {current_time}\n")
+
+                    # Update target network periodically (soft update)
                     if global_step % target_network_frequency == 0:
                         print("Update target network. Global step:", global_step)
                         for target_param, q_param in zip(target_network.parameters(), q_network.parameters()):
@@ -138,8 +148,13 @@ def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_
 
 # Device setup and environment creation
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 env = gym.vector.SyncVectorEnv([make_env("Pong-v4", 1, 0, False, "Pong")])
 
+# Timestamp file path
+timestamp_file_path = "runs/timestamp_log.txt"
+
 # Start training loop
-training_loop(env=env, total_timesteps=2000000, learning_starts=80000, train_frequency=4, batch_size=32,
-              gamma=0.99, device=device, save_interval=100000, target_network_frequency=1000, tau=0.005, model_push_frequency=1000)
+training_loop(env=env, total_timesteps=2000000, learning_starts=100000, train_frequency=4, batch_size=32,
+              gamma=0.99, device=device, save_interval=100000, target_network_frequency=1000, tau=0.005,
+              model_push_frequency=100, timestamp_file_path=timestamp_file_path)

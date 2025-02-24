@@ -14,7 +14,7 @@ from stable_baselines3.common.atari_wrappers import (
 )
 
 # Redis client for subscribing to the data
-redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
+redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
 def push_to_redis(channel, data):
     serialized_data = pickle.dumps(data)
     redis_client.publish(channel, serialized_data)

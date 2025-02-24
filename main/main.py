@@ -1,7 +1,7 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/dqn/#dqn_ataripy
 import os
 import random
 import time
+import datetime
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -59,6 +59,7 @@ def evaluate(
 
     return episodic_returns
 
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -79,7 +80,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Pong-v4"
     """the id of the environment"""
-    total_timesteps: int = 2000000
+    total_timesteps: int = 5000000
     """total timesteps of the experiments"""
     learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
@@ -258,10 +259,10 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-                # optimize the model
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                    # optimize the model
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
             # update target network
             if global_step % args.target_network_frequency == 0:
@@ -269,6 +270,14 @@ poetry run pip install "stable_baselines3==2.0.0a1" "gymnasium[atari,accept-rom-
                     target_network_param.data.copy_(
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
+
+            # Log timestamp every 100k steps: open, write and close the file immediately
+            if global_step % 100000 == 0:
+                current_time = datetime.datetime.now()
+                timestamp_file_path = f"runs/{run_name}/timestamps.txt"
+                with open(timestamp_file_path, 'a') as timestamp_file:
+                    timestamp_file.write(f"Step {global_step}: {current_time}\n")
+                print(f"Logged timestamp at step {global_step}: {current_time}")
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"

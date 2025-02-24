@@ -50,4 +50,4 @@ services:
           devices:
             - capabilities: [gpu]
     command: >
-      bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 15; done; python train.py"
+      bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 30; done; python train.py"
