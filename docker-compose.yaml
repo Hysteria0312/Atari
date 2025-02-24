@@ -25,6 +25,12 @@ services:
       - ./collector:/app
     networks:
       - redis_network
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
     scale: 1
     command: >
       bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 10; done; python collector.py"

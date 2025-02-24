@@ -4,7 +4,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import threading
-
+from collections import deque
 from stable_baselines3.common.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
@@ -15,6 +15,7 @@ from stable_baselines3.common.atari_wrappers import (
 
 # Redis client for subscribing to the data
 redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
+
 def push_to_redis(channel, data):
     serialized_data = pickle.dumps(data)
     redis_client.publish(channel, serialized_data)
@@ -73,7 +74,20 @@ def listen_for_model_updates(q_network, pubsub):
             print("Model updated in Q Network.")
 
 
-def collector(env, epsilon, device):
+def linear_epsilon_schedule(epsilon_start, epsilon_end, total_timesteps, current_step):
+    """
+    Linearly decays epsilon from epsilon_start to epsilon_end.
+    :param epsilon_start: Initial epsilon value.
+    :param epsilon_end: Final epsilon value (usually a small number, close to 0).
+    :param total_timesteps: Total training timesteps.
+    :param current_step: Current training step.
+    :return: Updated epsilon value.
+    """
+    epsilon = epsilon_start - (epsilon_start - epsilon_end) * (current_step / total_timesteps)
+    return max(epsilon, epsilon_end)  # Ensure epsilon doesn't go below epsilon_end
+
+
+def collector(env, epsilon_start, epsilon_end, total_timesteps, device, lock):
     q_network = QNetwork(env).to(device)
     pubsub = redis_client.pubsub()
     pubsub.subscribe('model_update')
@@ -83,7 +97,16 @@ def collector(env, epsilon, device):
 
     obs, _ = env.reset()
 
-    while True:
+    # Buffer for collecting data in batches
+    batch_size = 32
+    collected_data = deque(maxlen=batch_size)
+
+    total_episode_rewards = []  # To store the reward of each episode
+
+    for step in range(total_timesteps):
+        # Linearly decaying epsilon
+        epsilon = linear_epsilon_schedule(epsilon_start, epsilon_end, total_timesteps, step)
+
         # Epsilon-greedy action selection
         if np.random.rand() < epsilon:
             actions = np.array([env.single_action_space.sample() for _ in range(env.num_envs)])  # Random action
@@ -95,20 +118,34 @@ def collector(env, epsilon, device):
         next_obs, rewards, terminations, truncations, infos = env.step(actions)
         obs = next_obs
 
-        # Push data to Redis
-        data = {
+        # Collect experience in batch
+        collected_data.append({
             'observations': obs,
             'next_observations': next_obs,
             'actions': actions,
             'rewards': rewards,
             'dones': terminations,
-        }
-        push_to_redis('env_data', data)
+        })
+        # If batch is full, push to Redis
+        if len(collected_data) == batch_size:
+            # Lock for thread safety while pushing data
+            with lock:
+                push_to_redis('env_data', list(collected_data))
+                collected_data.clear()  # Clear collected data after pushing
 
 
 # Device setup and environment creation
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 env = gym.vector.SyncVectorEnv([make_env("Pong-v4", 1, 0, False, "Pong")])
 
+# Queue for data sharing between threads
+lock = threading.Lock()
+
+# Parameters for epsilon decay
+epsilon_start = 1.0  # Starting epsilon
+epsilon_end = 0.1    # Ending epsilon
+total_timesteps = 4000000  # Total number of training steps
+
 # Start collector
-collector(env=env, epsilon=0.1, device=device)
+# Just call the collector function without threading
+collector(env, epsilon_start, epsilon_end, total_timesteps, device, lock)
