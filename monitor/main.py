@@ -9,8 +9,8 @@ pynvml.nvmlInit()
 # 获取GPU数量
 device_count = pynvml.nvmlDeviceGetCount()
 
-monitor_duration = 300  # 单位：秒
-sampling_interval = 1  # 每隔1秒采样一次
+monitor_duration = 60
+sampling_interval = 0.5  # 每隔1秒采样一次
 
 # 存储GPU利用率数据
 gpu_utilizations = {i: [] for i in range(device_count)}

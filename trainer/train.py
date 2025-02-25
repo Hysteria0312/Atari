@@ -1,18 +1,14 @@
-import os
-import pickle
+import logging
 
-import numpy as np
+import redis
+import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import gymnasium as gym
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
-from random import random
-import redis
-import datetime
-from typing import Callable
+import gymnasium as gym
 from stable_baselines3.common.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
@@ -20,48 +16,10 @@ from stable_baselines3.common.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv,
 )
+import datetime
+
 # Redis client for subscribing to the data
 redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
-
-
-def evaluate(
-        model_path: str,
-        make_env: Callable,
-        env_id: str,
-        eval_episodes: int,
-        run_name: str,
-        Model: torch.nn.Module,
-        device: torch.device = torch.device("cpu"),
-        epsilon: float = 0.05,
-        capture_video: bool = True,
-):
-    # Check if model path exists
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
-    model = Model(envs).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-
-    obs, _ = envs.reset()
-    episodic_returns = []
-    while len(episodic_returns) < eval_episodes:
-        if random.random() < epsilon:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
-        else:
-            q_values = model(torch.Tensor(obs).to(device))
-            actions = torch.argmax(q_values, dim=1).cpu().numpy()
-        next_obs, _, _, _, infos = envs.step(actions)
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if "episode" not in info:
-                    continue
-                print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
-                episodic_returns += [info["episode"]["r"]]
-        obs = next_obs
-
-    return episodic_returns
 
 
 class QNetwork(nn.Module):
@@ -123,9 +81,10 @@ def linear_epsilon_schedule(epsilon_start, epsilon_end, total_timesteps, current
 
 
 # Training loop with experience pulled from Redis
+
+
 def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_size, gamma, device,
-                  save_interval, target_network_frequency, tau, model_push_frequency, timestamp_file_path,
-                  eval_episodes=10):
+                  save_interval, target_network_frequency, tau, model_push_frequency):
     q_network = QNetwork(env).to(device)
     target_network = QNetwork(env).to(device)  # 目标网络
     target_network.load_state_dict(q_network.state_dict())  # 初始化目标网络
@@ -142,11 +101,11 @@ def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_
     pubsub = redis_client.pubsub()
     pubsub.subscribe('env_data')
 
-    # Open the timestamp file for writing at the start
-    with open(timestamp_file_path, 'w') as timestamp_file:
-        timestamp_file.write(f"Training started at: {datetime.datetime.now()}\n")
-
-    episode_returns = []  # To store the returns of each episode
+    timestamp_file_path = f"runs/timestamps.txt"
+    current_time = datetime.datetime.now()
+    with open(timestamp_file_path, 'a') as timestamp_file:
+        timestamp_file.write(f"Step {global_step}: {current_time}\n")
+    print(f"Logged timestamp at step {global_step}: {current_time}")
 
     while global_step < total_timesteps:
         for message in pubsub.listen():
@@ -154,8 +113,8 @@ def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_
             if message['type'] == 'message':
                 data = pickle.loads(message['data'])
                 # Loop through the batch of experiences
+                global_step += 1
                 for experience in data:
-                    global_step += 1
                     observations = experience['observations']
                     next_observations = experience['next_observations']
                     actions = experience['actions']
@@ -188,31 +147,11 @@ def training_loop(env, total_timesteps, learning_starts, train_frequency, batch_
                     if global_step % model_push_frequency == 0:
                         model_data = q_network.state_dict()
                         redis_client.publish('model_update', pickle.dumps(model_data))
-                        print(f"Model pushed to Redis at step {global_step}")
+                        # print(f"Model pushed to Redis at step {global_step}")
 
-                        # Save the model to the disk
-                        model_save_path = f"runs/pong_model_{global_step}.pth"
-                        os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
-                        torch.save(q_network.state_dict(), model_save_path)
-                        print(f"Model saved at step {global_step}")
-
-                    # Evaluate every 100,000 steps
                     if global_step % save_interval == 0:
-                        print(f"Evaluating model at step {global_step}")
-                        episodic_returns = evaluate(
-                            model_path=f"runs/pong_model_{global_step}.pth",
-                            make_env=make_env,
-                            env_id="Pong-v4",
-                            eval_episodes=eval_episodes,
-                            run_name=f"evaluation_{global_step}",
-                            Model=QNetwork,
-                            device=device,
-                            epsilon=0.05
-                        )
-                        # Log episodic returns to TensorBoard
-                        for idx, episodic_return in enumerate(episodic_returns):
-                            writer.add_scalar("eval/episodic_return", episodic_return, global_step + idx)
-                        # Log timestamp every 100,000 steps: open, write and close the file immediately
+                        print(f"Saving model at step {global_step}")
+                        torch.save(q_network.state_dict(), f"runs/pong_model_{global_step}.pth")
                         current_time = datetime.datetime.now()
                         timestamp_file_path = f"runs/timestamps.txt"
                         with open(timestamp_file_path, 'a') as timestamp_file:
@@ -227,10 +166,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 env = gym.vector.SyncVectorEnv([make_env("Pong-v4", 1, 0, False, "Pong")])
 
-# Timestamp file path
-timestamp_file_path = "runs/timestamp_log.txt"
-
 # Start training loop
-training_loop(env=env, total_timesteps=4000000, learning_starts=100000, train_frequency=4, batch_size=32,
+training_loop(env=env, total_timesteps=2000000, learning_starts=80000, train_frequency=4, batch_size=32,
               gamma=0.99, device=device, save_interval=100000, target_network_frequency=1000, tau=0.005,
-              model_push_frequency=100, timestamp_file_path=timestamp_file_path)
+              model_push_frequency=100)

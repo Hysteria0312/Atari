@@ -88,7 +88,7 @@ def generate_video(model_path, env_id, run_name, device, eval_episodes=1, epsilo
 
 
 if __name__ == "__main__":
-    model_path = "./pong_model_4000000.pth"
+    model_path = "./main.cleanrl_model"
     env_id = "Pong-v4"
     run_name = "replay"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

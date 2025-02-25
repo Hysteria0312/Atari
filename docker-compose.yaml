@@ -10,6 +10,7 @@ services:
     networks:
       - redis_network
     platform: linux/amd64
+    command: ["redis-server", "--maxmemory", "4gb", "--maxmemory-policy", "allkeys-lru"]
 
   collector:
     build:
