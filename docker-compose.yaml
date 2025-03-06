@@ -27,11 +27,34 @@ services:
     networks:
       - redis_network
     runtime: nvidia
-    scale: 3
     deploy:
       resources:
         reservations:
           devices:
-            - capabilities: [gpu]
+            - capabilities: [ gpu ]
     command: >
-      bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 30; done; python train.py"
+      bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 10; done; python train.py"
+
+  actor:
+    build:
+      context: .
+      dockerfile: ./actor/Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+      - trainer
+    volumes:
+      - ./actor:/app
+    networks:
+      - redis_network
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [ gpu ]
+    scale: 2
+    command: >
+      bash -c "until nc -z redis 6379; do echo 'Waiting for Redis...'; sleep 10; done; python actor.py"

@@ -1,96 +1,115 @@
 import os
-import random
-
+import json
+import glob
+import argparse
+import matplotlib.pyplot as plt
 import numpy as np
-import torch
-import gymnasium as gym
-from stable_baselines3.common.atari_wrappers import NoopResetEnv, MaxAndSkipEnv, EpisodicLifeEnv, FireResetEnv, \
-    ClipRewardEnv
-from torch import nn
-from torch.utils.tensorboard import SummaryWriter
 
 
-class QNetwork(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, env.single_action_space.n),
-        )
+def compare_json_files(output_file="comparison.png", x_key="step", y_key="mean_return", smooth_factor=0):
+    """
+    比较文件夹中所有JSON文件的step和mean_return数据
 
-    def forward(self, x):
-        return self.network(x / 255.0)
-def load_model(model_path, env, device):
-    q_network = QNetwork(env).to(device)
-    q_network.load_state_dict(torch.load(model_path, map_location=device))
-    q_network.eval()
-    return q_network
+    参数:
+        folder: 包含JSON文件的文件夹
+        output_file: 输出图像文件路径
+        x_key: 用于X轴的JSON键名
+        y_key: 用于Y轴的JSON键名
+        smooth_factor: 平滑因子 (0表示不平滑)
+    """
+    # 查找所有JSON文件
+    json_files = glob.glob(os.path.join("", "*.json"))
 
+    # 按字母顺序排序文件
+    json_files.sort()
 
-# 创建环境
-def make_env(env_id, seed, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
+    plt.figure(figsize=(12, 8))
 
-        env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
-        env = EpisodicLifeEnv(env)
-        if "FIRE" in env.unwrapped.get_action_meanings():
-            env = FireResetEnv(env)
-        env = ClipRewardEnv(env)
-        env = gym.wrappers.ResizeObservation(env, (84, 84))
-        env = gym.wrappers.GrayScaleObservation(env)
-        env = gym.wrappers.FrameStack(env, 4)
+    # 使用不同的颜色和标记
+    colors = plt.cm.tab10(np.linspace(0, 1, len(json_files)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
 
-        env.action_space.seed(seed)
-        return env
+    for i, json_file in enumerate(json_files):
+        file_name = os.path.basename(json_file).replace('.json', '')
 
-    return thunk
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
 
+            # 提取数据
+            steps = []
+            returns = []
 
-# 生成视频
-def generate_video(model_path, env_id, run_name, device, eval_episodes=1, epsilon=0.05):
-    env = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, True, run_name)])
+            # 处理不同的JSON结构
+            if isinstance(data, list):
+                # 如果是列表格式，遍历每个元素
+                for item in data:
+                    if x_key in item and y_key in item:
+                        steps.append(item[x_key])
+                        returns.append(item[y_key])
+            elif isinstance(data, dict):
+                # 如果是字典格式
+                if x_key in data and y_key in data:
+                    steps.append(data[x_key])
+                    returns.append(data[y_key])
 
-    model = load_model(model_path, env, device)
+            # 确保有数据
+            if not steps or not returns:
+                print(f"警告: 在 {json_file} 中未找到 {x_key} 或 {y_key} 数据")
+                continue
 
-    obs, _ = env.reset()
+            # 排序数据点
+            if len(steps) > 1:
+                sorted_pairs = sorted(zip(steps, returns))
+                steps, returns = zip(*sorted_pairs)
 
-    for _ in range(eval_episodes):
-        done = False
-        while not done:
-            if random.random() < epsilon:
-                actions = np.array([env.single_action_space.sample() for _ in range(env.num_envs)])
+            # 应用平滑处理
+            if smooth_factor > 0 and len(returns) > 2:
+                smoothed_returns = []
+                window = max(2, int(len(returns) * smooth_factor))
+                for j in range(len(returns)):
+                    start = max(0, j - window // 2)
+                    end = min(len(returns), j + window // 2 + 1)
+                    smoothed_returns.append(np.mean(returns[start:end]))
+
+                # 绘制原始数据（半透明）和平滑数据
+                plt.plot(steps, returns, alpha=0.3, color=colors[i])
+                plt.plot(steps, smoothed_returns, label=file_name,
+                         marker=markers[i % len(markers)], markersize=8,
+                         markevery=max(1, len(steps) // 10),
+                         linewidth=2, color=colors[i])
             else:
-                q_values = model(torch.Tensor(obs).to(device))
-                actions = torch.argmax(q_values, dim=1).cpu().numpy()
+                # 直接绘制原始数据
+                plt.plot(steps, returns, label=file_name,
+                         marker=markers[i % len(markers)], markersize=8,
+                         markevery=max(1, len(steps) // 10),
+                         linewidth=2, color=colors[i])
 
-            next_obs, _, terminations, truncations, infos = env.step(actions)
+        except Exception as e:
+            print(f"处理 {json_file} 时出错: {e}")
 
-            done = any(terminations) or any(truncations)
+    # 添加图表元素
+    plt.title(f"{y_key} vs {x_key}", fontsize=16)
+    plt.xlabel(x_key.capitalize(), fontsize=14)
+    plt.ylabel(y_key.capitalize(), fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(loc='best', fontsize=12)
 
-            obs = next_obs
+    # 保存图表
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300)
+    print(f"图表已保存至 {output_file}")
 
-    env.close()
+    return output_file
 
 
 if __name__ == "__main__":
-    model_path = "./main.cleanrl_model"
-    env_id = "Pong-v4"
-    run_name = "replay"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser(description="比较文件夹中所有JSON文件的数据")
+    parser.add_argument("--output", type=str, default="comparison.png", help="输出文件路径")
+    parser.add_argument("--x-key", type=str, default="step", help="用于X轴的JSON键")
+    parser.add_argument("--y-key", type=str, default="mean_return", help="用于Y轴的JSON键")
+    parser.add_argument("--smooth", type=float, default=0.0, help="平滑因子 (0-1)")
 
-    generate_video(model_path, env_id, run_name, device)
+    args = parser.parse_args()
+
+    compare_json_files(args.output, args.x_key, args.y_key, args.smooth)

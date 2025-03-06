@@ -1,8 +1,11 @@
 import pickle
+import random
 import time
 import datetime
 import os
 import json
+import threading
+import gymnasium as gym
 
 import redis
 import torch
@@ -10,9 +13,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
-import gymnasium as gym
-import random
 from stable_baselines3.common.buffers import ReplayBuffer
+from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.atari_wrappers import (
     ClipRewardEnv,
     EpisodicLifeEnv,
@@ -20,13 +22,15 @@ from stable_baselines3.common.atari_wrappers import (
     MaxAndSkipEnv,
     NoopResetEnv,
 )
-from torch.utils.tensorboard import SummaryWriter
 
-# Redis client for communication
-redis_client = redis.StrictRedis(host='127.0.0.1', port=6379, db=0)
+# Redis client for model synchronization and experience collection
+redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
+PUBSUB_CHANNEL = "experience_channel"
 
 
 def make_env(env_id, seed, idx, capture_video, run_dir):
+    """Create a wrapped environment for evaluation"""
+
     def thunk():
         if capture_video and idx == 0:
             video_dir = os.path.join(run_dir, "videos")
@@ -53,13 +57,8 @@ def make_env(env_id, seed, idx, capture_video, run_dir):
     return thunk
 
 
-def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
-    slope = (end_e - start_e) / duration
-    return max(slope * t + start_e, end_e)
-
-
 class QNetwork(nn.Module):
-    def __init__(self, env):
+    def __init__(self, observation_space, action_space):
         super().__init__()
         self.network = nn.Sequential(
             nn.Conv2d(4, 32, 8, stride=4),
@@ -71,7 +70,7 @@ class QNetwork(nn.Module):
             nn.Flatten(),
             nn.Linear(3136, 512),
             nn.ReLU(),
-            nn.Linear(512, env.single_action_space.n),
+            nn.Linear(512, action_space.n),
         )
 
     def forward(self, x):
@@ -82,47 +81,72 @@ class ModelSynchronizer:
     def __init__(self, model_key="latest_model", version_key="model_version"):
         self.model_key = model_key
         self.version_key = version_key
-        self.redis_client = redis.StrictRedis(host='127.0.0.1', port=6379, db=0)
+        self.redis_client = redis.StrictRedis(host='redis', port=6379, db=0)
 
     def save_model(self, model, version):
-        """ Save the latest model to Redis with a version number only if the version is newer. """
-        redis_version = self.redis_client.get(self.version_key)
-        if redis_version is not None:
-            redis_version = int(redis_version)
-            if version > redis_version:
-                # Only save the model if the local version is greater than the Redis version
-                model_data = pickle.dumps(model.state_dict())
-                self.redis_client.set(self.model_key, model_data)
-                self.redis_client.set(self.version_key, version)  # Save the model version
-                print(f"Model saved to Redis with version {version}.")
-            else:
-                print(f"Local version {version} is not newer than Redis version {redis_version}. Model not saved.")
-        else:
-            # If Redis doesn't have a version, save the model
-            model_data = pickle.dumps(model.state_dict())
-            self.redis_client.set(self.model_key, model_data)
-            self.redis_client.set(self.version_key, version)  # Save the model version
-            print(f"Model saved to Redis with version {version}.")
+        """ Save the model to Redis with a version number. """
+        model_data = pickle.dumps(model.state_dict())
+        self.redis_client.set(self.model_key, model_data)
+        self.redis_client.set(self.version_key, version)
+        print(f"Model saved to Redis with version {version}.")
 
-    def load_model(self, model, local_version):
-        """ Load the latest model from Redis only if the version is newer. """
-        redis_version = self.redis_client.get(self.version_key)
-        if redis_version is not None:
-            redis_version = int(redis_version)
-            if redis_version > local_version:
-                model_data = self.redis_client.get(self.model_key)
-                if model_data is not None:
-                    model.load_state_dict(pickle.loads(model_data))
-                    print(f"Loaded model from Redis with version {redis_version}.")
-                    return redis_version
-                else:
-                    print("No model found in Redis.")
-                    return local_version
-            else:
-                return local_version
-        else:
-            print("No model found in Redis, using local model.")
-            return local_version
+
+class ExperienceCollector:
+    def __init__(self, replay_buffer):
+        self.replay_buffer = replay_buffer
+        self.pubsub = redis_client.pubsub()
+        self.pubsub.subscribe(PUBSUB_CHANNEL)
+        self.running = True
+        self.thread = None
+
+    def start_collecting(self):
+        """Start the experience collection thread."""
+        self.thread = threading.Thread(target=self._collection_loop)
+        self.thread.daemon = True
+        self.thread.start()
+        print("Experience collection thread started.")
+
+    def stop_collecting(self):
+        """Stop the experience collection thread."""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        self.pubsub.unsubscribe()
+        print("Experience collection stopped.")
+
+    def _collection_loop(self):
+        """Main loop for collecting experiences from actors."""
+        print("Experience collection loop started.")
+        experiences_received = 0
+
+        for message in self.pubsub.listen():
+            if not self.running:
+                break
+
+            if message["type"] == "message":
+                try:
+                    # Decode and deserialize the experience data
+                    # Now the message contains a batch of experiences rather than a single one
+                    experience_batch = pickle.loads(message["data"])
+
+                    batch_size = len(experience_batch)
+
+                    # Process each experience in the batch
+                    for experience_data in experience_batch:
+                        # Add to replay buffer
+                        self.replay_buffer.add(
+                            experience_data["obs"],
+                            experience_data["next_obs"],
+                            experience_data["action"],
+                            experience_data["reward"],
+                            experience_data["done"],
+                            experience_data["info"]
+                        )
+
+                    experiences_received += batch_size
+
+                except Exception as e:
+                    print(f"Error processing experience batch: {e}")
 
 
 def evaluate(model, env_id, eval_episodes, run_dir, device, epsilon=0.05, capture_video=True,
@@ -200,27 +224,6 @@ def evaluate(model, env_id, eval_episodes, run_dir, device, epsilon=0.05, captur
     return evaluation_metrics
 
 
-def save_model_checkpoint(model, run_dir, checkpoint_name):
-    """
-    Save model checkpoint to a specific location.
-
-    Args:
-        model: Model to save
-        run_dir: Run directory
-        checkpoint_name: Name of the checkpoint
-    """
-    # Ensure models directory exists
-    models_dir = os.path.join(run_dir, "models")
-    os.makedirs(models_dir, exist_ok=True)
-
-    # Save the model
-    checkpoint_path = os.path.join(models_dir, f"{checkpoint_name}.pt")
-    torch.save(model.state_dict(), checkpoint_path)
-    print(f"Model checkpoint saved to {checkpoint_path}")
-
-    return checkpoint_path
-
-
 def save_evaluation_results(metrics, run_dir, evaluation_name):
     """
     Save evaluation results to a JSON file.
@@ -247,7 +250,7 @@ def save_evaluation_results(metrics, run_dir, evaluation_name):
 def setup_run_directory(env_id):
     """Set up a run directory with a timestamp"""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{env_id}_{timestamp}"
+    run_name = f"{env_id}_trainer_{timestamp}"
     run_dir = os.path.join("runs", run_name)
 
     # Create directories
@@ -269,41 +272,33 @@ def save_training_config(config, run_dir):
     return config_path
 
 
-def training_loop(env, env_id, total_timesteps, learning_starts, train_frequency, batch_size, gamma, device,
-                  target_network_frequency, tau, eval_frequency=100000, checkpoint_frequency=100000):
-    """
-    Main training loop for DQN with periodic evaluations and checkpoints.
+def save_model_checkpoint(model, run_dir, checkpoint_name):
+    """Save model checkpoint to a specific location."""
+    models_dir = os.path.join(run_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    checkpoint_path = os.path.join(models_dir, f"{checkpoint_name}.pt")
+    torch.save(model.state_dict(), checkpoint_path)
+    print(f"Model checkpoint saved to {checkpoint_path}")
+    return checkpoint_path
 
-    Args:
-        env: Environment
-        env_id: Environment ID
-        total_timesteps: Total timesteps for training
-        learning_starts: Learning starts after this many steps
-        train_frequency: Train every N steps
-        batch_size: Batch size for training
-        gamma: Discount factor
-        device: Device to run on (cuda/cpu)
-        target_network_frequency: Update target network every N steps
-        tau: Soft update coefficient
-        eval_frequency: Evaluate model every N steps
-        checkpoint_frequency: Save model checkpoint every N steps
-    """
-    # Setup run directory with timestamp
+
+def trainer_loop(observation_space, action_space, env_id, total_timesteps,
+                 batch_size, gamma, device, target_network_frequency, tau,
+                 checkpoint_frequency=10000, eval_frequency=100000, buffer_size=200000):
     run_dir = setup_run_directory(env_id)
 
     # Save training configuration
     config = {
         "env_id": env_id,
         "total_timesteps": total_timesteps,
-        "learning_starts": learning_starts,
-        "train_frequency": train_frequency,
         "batch_size": batch_size,
         "gamma": gamma,
         "device": str(device),
         "target_network_frequency": target_network_frequency,
         "tau": tau,
-        "eval_frequency": eval_frequency,
         "checkpoint_frequency": checkpoint_frequency,
+        "eval_frequency": eval_frequency,
+        "buffer_size": buffer_size,
         "start_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     save_training_config(config, run_dir)
@@ -312,18 +307,18 @@ def training_loop(env, env_id, total_timesteps, learning_starts, train_frequency
     writer = SummaryWriter(os.path.join(run_dir, "logs"))
 
     # Initialize networks
-    q_network = QNetwork(env).to(device)
-    target_network = QNetwork(env).to(device)
+    q_network = QNetwork(observation_space, action_space).to(device)
+    target_network = QNetwork(observation_space, action_space).to(device)
+    target_network.load_state_dict(q_network.state_dict())  # Initial sync
 
-    # Start with local version 0
-    local_version = 0
+    # Setup model synchronizer
+    model_version = 0
     model_synchronizer = ModelSynchronizer()
 
-    # Check if we need to load a newer model version from Redis
-    local_version = model_synchronizer.load_model(target_network, local_version)
-    q_network.load_state_dict(target_network.state_dict())
+    # Save initial model to Redis
+    model_synchronizer.save_model(q_network, model_version)
 
-    # Save initial model
+    # Save initial model checkpoint
     save_model_checkpoint(q_network, run_dir, "initial_model")
 
     # Setup optimizer
@@ -331,186 +326,195 @@ def training_loop(env, env_id, total_timesteps, learning_starts, train_frequency
 
     # Setup replay buffer
     rb = ReplayBuffer(
-        200000,
-        env.single_observation_space,
-        env.single_action_space,
+        buffer_size,
+        observation_space,
+        action_space,
         device,
         optimize_memory_usage=True,
         handle_timeout_termination=False
     )
 
+    # Setup experience collector
+    collector = ExperienceCollector(rb)
+    collector.start_collecting()
+
+    # Main training loop
     start_time = time.time()
-    obs, _ = env.reset()
+    total_updates = 0
 
     # Store evaluation results
     evaluations = []
 
-    # Main training loop
-    for global_step in range(total_timesteps):
-        # Epsilon-greedy action selection (for exploration)
-        epsilon = linear_schedule(1.0, 0.01, 0.1 * total_timesteps, global_step)
-        if random.random() < epsilon:
-            actions = np.array([env.single_action_space.sample() for _ in range(env.num_envs)])  # Random action
-        else:
-            q_values = q_network(torch.Tensor(obs).to(device))
-            actions = torch.argmax(q_values, dim=1).cpu().numpy()  # Choose action with highest Q-value
+    try:
+        while total_updates < total_timesteps:
+            # Only train if we have enough samples
+            if rb.size() < batch_size:
+                time.sleep(1)
+                continue
 
-        next_obs, rewards, terminations, truncations, infos = env.step(actions)
-
-        # Log episode metrics
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if info and "episode" in info:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                    writer.add_scalar("charts/epsilon", epsilon, global_step)
-
-        # Handle truncated episodes
-        real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
-
-        # Add to replay buffer
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
-        obs = next_obs
-
-        # Training step
-        if global_step > learning_starts and global_step % train_frequency == 0:
+            # Sample from replay buffer
             data = rb.sample(batch_size)
 
+            # Calculate TD target
             with torch.no_grad():
                 target_max, _ = target_network(data.next_observations).max(dim=1)
                 td_target = data.rewards.flatten() + gamma * target_max * (1 - data.dones.flatten())
 
-            old_val = q_network(data.observations).gather(1, data.actions).squeeze()
-            loss = F.mse_loss(td_target, old_val)
+            # Calculate current Q-values
+            current_q = q_network(data.observations).gather(1, data.actions).squeeze()
 
+            # Calculate loss
+            loss = F.mse_loss(td_target, current_q)
+
+            # Optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            writer.add_scalar("charts/loss", loss.item(), global_step)
+            # Increment update counter
+            total_updates += 1
 
-            # Log training metrics periodically
-            if global_step % 100 == 0:
-                sps = int(global_step / (time.time() - start_time))
-                print(f"Step: {global_step}/{total_timesteps}, SPS: {sps}, Loss: {loss.item():.5f}")
-                writer.add_scalar("charts/SPS", sps, global_step)
-
-                # Try to load newer model from Redis
-                local_version = model_synchronizer.load_model(target_network, local_version)
+            # Log metrics periodically
+            if total_updates % 100 == 0:
+                sps = int(total_updates / (time.time() - start_time))
+                print(
+                    f"Updates: {total_updates}/{total_timesteps}, SPS: {sps}")
+                writer.add_scalar("charts/loss", loss.item(), total_updates)
+                writer.add_scalar("charts/SPS", sps, total_updates)
+                model_version += 1
+                model_synchronizer.save_model(q_network, model_version)
 
             # Update target network periodically
-            if global_step % target_network_frequency == 0:
+            if total_updates % target_network_frequency == 0:
+                # Soft update
                 for target_param, q_param in zip(target_network.parameters(), q_network.parameters()):
                     target_param.data.copy_(tau * q_param.data + (1.0 - tau) * target_param.data)
 
-                # Update the model version and save it to Redis
-                local_version += 1
-                model_synchronizer.save_model(target_network, local_version)
+                # Increment version and save to Redis
+                writer.add_scalar("charts/model_version", model_version, total_updates)
 
-                # Log target network update
-                writer.add_scalar("charts/target_updates", local_version, global_step)
+            # Periodic evaluation
+            if total_updates % eval_frequency == 0:
+                # Run evaluation
+                eval_metrics = evaluate(
+                    model=target_network,
+                    env_id=env_id,
+                    eval_episodes=10,
+                    run_dir=run_dir,
+                    device=device,
+                    epsilon=0.05,
+                    capture_video=(total_updates % (eval_frequency * 5) == 0),  # Record video less frequently
+                    evaluation_name=f"eval_{total_updates // 1000}k"
+                )
 
-        # Periodic evaluation
-        if global_step > 0 and global_step % eval_frequency == 0:
-            # Run evaluation
-            eval_metrics = evaluate(
-                model=target_network,
-                env_id=env_id,
-                eval_episodes=10,
-                run_dir=run_dir,
-                device=device,
-                epsilon=0.05,
-                capture_video=(global_step % (eval_frequency * 5) == 0),  # Record video less frequently
-                evaluation_name=f"eval_{global_step // 1000}k"
-            )
+                # Add current step information
+                eval_metrics["step"] = total_updates
 
-            # Add current step information
-            eval_metrics["step"] = global_step
+                # Save evaluation results
+                save_evaluation_results(eval_metrics, run_dir, f"eval_{total_updates // 1000}k")
 
-            # Save evaluation results
-            save_evaluation_results(eval_metrics, run_dir, f"eval_{global_step // 1000}k")
+                # Add to evaluations list
+                evaluations.append(eval_metrics)
 
-            # Add to evaluations list
-            evaluations.append(eval_metrics)
+                # Log to tensorboard
+                writer.add_scalar("evaluation/mean_return", eval_metrics["mean_return"], total_updates)
+                writer.add_scalar("evaluation/median_return", eval_metrics["median_return"], total_updates)
 
-            # Log to tensorboard
-            writer.add_scalar("evaluation/mean_return", eval_metrics["mean_return"], global_step)
-            writer.add_scalar("evaluation/median_return", eval_metrics["median_return"], global_step)
+            # Periodic checkpoint saving
+            if total_updates % checkpoint_frequency == 0:
+                save_model_checkpoint(target_network, run_dir, f"checkpoint_{total_updates // 1000}k")
 
-        # Periodic checkpoint saving
-        if global_step > 0 and global_step % checkpoint_frequency == 0:
-            save_model_checkpoint(target_network, run_dir, f"checkpoint_{global_step // 1000}k")
+    except KeyboardInterrupt:
+        print("Training interrupted by user")
+    finally:
+        # Clean up
+        collector.stop_collecting()
 
-    print(f"Training completed! Total time: {time.time() - start_time:.2f} seconds")
+        # Save final model
+        final_model_path = save_model_checkpoint(target_network, run_dir, "final_model")
+        model_synchronizer.save_model(target_network, model_version + 1)
 
-    # Save all evaluations in a single file
-    all_evals_path = os.path.join(run_dir, "evaluations", "all_evaluations.json")
-    with open(all_evals_path, 'w') as f:
-        json.dump(evaluations, f, indent=4)
+        # Save all evaluations in a single file
+        all_evals_path = os.path.join(run_dir, "evaluations", "Distributed_2Actor.json.json")
+        with open(all_evals_path, 'w') as f:
+            json.dump(evaluations, f, indent=4)
 
-    # Final model saving
-    final_model_path = save_model_checkpoint(target_network, run_dir, "final_model")
+        # Final evaluation
+        print("Running final evaluation...")
+        final_eval_metrics = evaluate(
+            model=target_network,
+            env_id=env_id,
+            eval_episodes=20,  # More episodes for final evaluation
+            run_dir=run_dir,
+            device=device,
+            epsilon=0.05,
+            capture_video=True,
+            evaluation_name="final_evaluation"
+        )
 
-    # Final evaluation
-    print("Running final evaluation...")
-    final_eval_metrics = evaluate(
-        model=target_network,
-        env_id=env_id,
-        eval_episodes=20,  # More episodes for final evaluation
-        run_dir=run_dir,
-        device=device,
-        epsilon=0.05,
-        capture_video=True,
-        evaluation_name="final_evaluation"
-    )
+        # Add final information
+        final_eval_metrics["step"] = total_updates
+        final_eval_metrics["total_training_time"] = time.time() - start_time
 
-    # Add final information
-    final_eval_metrics["step"] = total_timesteps
-    final_eval_metrics["total_training_time"] = time.time() - start_time
+        # Save final evaluation
+        save_evaluation_results(final_eval_metrics, run_dir, "final_evaluation")
 
-    # Save final evaluation
-    save_evaluation_results(final_eval_metrics, run_dir, "final_evaluation")
+        # Close tensorboard writer
+        writer.close()
 
-    # Close tensorboard writer
-    writer.close()
+        print(f"Training completed! Total time: {time.time() - start_time:.2f} seconds")
+        print(f"Run directory: {run_dir}")
+        print(f"Final model: {final_model_path}")
 
-    print(f"All training results saved to {run_dir}")
-    print(f"Final model saved to {final_model_path}")
-
-    return {
-        "run_dir": run_dir,
-        "final_model_path": final_model_path,
-        "final_eval_metrics": final_eval_metrics
-    }
+        return {
+            "run_dir": run_dir,
+            "final_model_path": final_model_path,
+            "model_version": model_version + 1,
+            "final_eval_metrics": final_eval_metrics
+        }
 
 
 if __name__ == "__main__":
-    # Setup for training
+    from gymnasium.spaces import Box, Discrete
+    import argparse
+
+    parser = argparse.ArgumentParser(description="RL Trainer for distributed training")
+    parser.add_argument("--env-id", type=str, required=False, default="Pong-v4", help="Environment ID")
+    parser.add_argument("--timesteps", type=int, required=False, default=1000000, help="Total timesteps for training")
+    parser.add_argument("--batch-size", type=int, required=False, default=32, help="Training batch size")
+    parser.add_argument("--buffer-size", type=int, required=False, default=200000, help="Replay buffer size")
+    parser.add_argument("--gamma", type=float, required=False, default=0.99, help="Discount factor")
+    parser.add_argument("--target-update-freq", required=False, type=int, default=1000,
+                        help="Target network update frequency")
+    parser.add_argument("--tau", type=float, required=False, default=1.0,
+                        help="Target network update rate (1.0 = hard update)")
+    parser.add_argument("--checkpoint-freq", required=False, type=int, default=100000,
+                        help="Checkpoint saving frequency")
+    parser.add_argument("--eval-freq", required=False, type=int, default=100000, help="Evaluation frequency")
+
+    args = parser.parse_args()
+
+    # Create example observation and action spaces for testing
+    # These would match the spaces in the environments created by actors
+    observation_space = Box(low=0, high=255, shape=(4, 84, 84), dtype=np.uint8)
+    action_space = Discrete(6)
+
+    # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env_id = "Pong-v4"
-    env = gym.vector.SyncVectorEnv([make_env(env_id, 1, 0, False, "temp")])  # temp dir will be replaced
+    print(f"Training on device: {device}")
 
-    # Start training
-    results = training_loop(
-        env=env,
-        env_id=env_id,
-        total_timesteps=1000000,
-        learning_starts=50000,
-        train_frequency=4,
-        batch_size=32,
-        gamma=0.99,
+    # Start trainer
+    trainer_loop(
+        observation_space=observation_space,
+        action_space=action_space,
+        env_id=args.env_id,
+        total_timesteps=args.timesteps,
+        batch_size=args.batch_size,
+        gamma=args.gamma,
         device=device,
-        target_network_frequency=1000,
-        tau=1.0,
-        eval_frequency=100000,
-        checkpoint_frequency=100000
+        target_network_frequency=args.target_update_freq,
+        tau=args.tau,
+        checkpoint_frequency=args.checkpoint_freq,
+        eval_frequency=args.eval_freq,
+        buffer_size=args.buffer_size
     )
-
-    print(f"Training successfully completed!")
-    print(f"Run directory: {results['run_dir']}")
-    print(f"Final model: {results['final_model_path']}")
-    print(f"Final mean return: {results['final_eval_metrics']['mean_return']:.2f}")
